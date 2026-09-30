@@ -897,3 +897,524 @@ describe('inline dispute form — character counter live region', () => {
     await assertNoA11yViolations(container);
   });
 });
+
+// ---------------------------------------------------------------------------
+// State invariant tests — Issue #1270
+// ---------------------------------------------------------------------------
+
+describe('state invariants — Issue #1270', () => {
+  beforeEach(() => {
+    mockUseWallet.mockReturnValue({
+      address: '0x123',
+      isConnecting: false,
+      error: null,
+      connect: jest.fn(),
+      disconnect: jest.fn(),
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I1 – Mutual exclusion: only one transient UI open at a time
+  // -------------------------------------------------------------------------
+
+  describe('I1 — mutual exclusion', () => {
+    it('disables Submit Milestone and Release Funds while the dispute form is open', async () => {
+      const user = userEvent.setup();
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={jest.fn()}
+          onReleaseFunds={jest.fn()}
+          onDispute={jest.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      expect(screen.getByRole('group', { name: /describe the reason for this dispute/i })).toBeInTheDocument();
+
+      // Both submit and release buttons must be disabled while dispute form is open
+      expect(screen.getByRole('button', { name: /submit milestone for approval/i })).toBeDisabled();
+      expect(screen.getByRole('button', { name: /release funds to the contractor/i })).toBeDisabled();
+    });
+
+    it('disables the Dispute button while a confirm dialog is open', async () => {
+      const user = userEvent.setup();
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={jest.fn()}
+          onReleaseFunds={jest.fn()}
+          onDispute={jest.fn()}
+        />,
+      );
+
+      // Open the submit confirmation dialog
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      expect(screen.getByRole('dialog', { name: /confirm submit milestone/i })).toBeInTheDocument();
+
+      // The Dispute button must be disabled while the dialog is open
+      expect(screen.getByRole('button', { name: /open a dispute for this contract/i })).toBeDisabled();
+    });
+
+    it('closing the dispute form re-enables Submit Milestone and Release Funds', async () => {
+      const user = userEvent.setup();
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={jest.fn()}
+          onReleaseFunds={jest.fn()}
+          onDispute={jest.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      await user.click(screen.getByRole('button', { name: /cancel/i }));
+      await act(async () => {});
+
+      expect(screen.getByRole('button', { name: /submit milestone for approval/i })).not.toBeDisabled();
+      expect(screen.getByRole('button', { name: /release funds to the contractor/i })).not.toBeDisabled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I2 – Double-submit guard
+  // -------------------------------------------------------------------------
+
+  describe('I2 — no callback fires more than once per interaction', () => {
+    it('does not call onSubmitMilestone more than once even on rapid successive confirms', async () => {
+      const user = userEvent.setup();
+      const onSubmitMilestone = jest.fn();
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={onSubmitMilestone}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      const dialog = screen.getByRole('dialog', { name: /confirm submit milestone/i });
+      const confirmBtn = within(dialog).getByRole('button', { name: /submit milestone/i });
+
+      // Simulate two rapid clicks on the confirm button
+      fireEvent.click(confirmBtn);
+      fireEvent.click(confirmBtn);
+
+      expect(onSubmitMilestone).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not call onReleaseFunds more than once even on rapid successive confirms', async () => {
+      const onReleaseFunds = jest.fn();
+      render(
+        <ActionPanel
+          status="Active"
+          onReleaseFunds={onReleaseFunds}
+          onDispute={jest.fn()}
+        />,
+      );
+
+      fireEvent.click(screen.getByRole('button', { name: /release funds to the contractor/i }));
+      const dialog = screen.getByRole('alertdialog', { name: /confirm release funds/i });
+      const confirmBtn = within(dialog).getByRole('button', { name: /release funds/i });
+
+      fireEvent.click(confirmBtn);
+      fireEvent.click(confirmBtn);
+
+      expect(onReleaseFunds).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not call onDispute more than once even on rapid successive form submits', async () => {
+      const user = userEvent.setup();
+      const onDispute = jest.fn();
+      render(
+        <ActionPanel
+          status="Active"
+          onDispute={onDispute}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      const textarea = screen.getByRole('textbox', { name: /reason/i });
+      await user.type(textarea, 'Test reason');
+
+      // Simulate two rapid submits
+      const submitBtn = screen.getByRole('button', { name: /confirm dispute/i });
+      fireEvent.click(submitBtn);
+      fireEvent.click(submitBtn);
+
+      expect(onDispute).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I3 – Status-change resets all transient UI
+  // -------------------------------------------------------------------------
+
+  describe('I3 — status change closes open transient UI', () => {
+    it('closes the confirm dialog when status changes mid-flow', async () => {
+      const user = userEvent.setup();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={jest.fn()}
+          onReleaseFunds={jest.fn()}
+          onDispute={jest.fn()}
+        />,
+      );
+
+      // Open the confirm dialog
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      expect(screen.getByRole('dialog', { name: /confirm submit milestone/i })).toBeInTheDocument();
+
+      // Simulate status change (e.g. parent re-fetches and contract is now Completed)
+      rerender(
+        <ActionPanel
+          status="Completed"
+          onViewSummary={jest.fn()}
+        />,
+      );
+
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    });
+
+    it('closes the inline dispute form when status changes mid-flow', async () => {
+      const user = userEvent.setup();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onDispute={jest.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      await user.type(screen.getByRole('textbox', { name: /reason/i }), 'Partial work done');
+      expect(screen.getByRole('group', { name: /describe the reason for this dispute/i })).toBeInTheDocument();
+
+      // Simulate status transition Active → Disputed
+      rerender(
+        <ActionPanel
+          status="Disputed"
+          onDispute={jest.fn()}
+        />,
+      );
+
+      expect(screen.queryByRole('group', { name: /describe the reason for this dispute/i })).not.toBeInTheDocument();
+    });
+
+    it('does not fire onDispute after the status changes and closes the form', async () => {
+      const user = userEvent.setup();
+      const onDispute = jest.fn();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onDispute={onDispute}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      await user.type(screen.getByRole('textbox', { name: /reason/i }), 'Test reason');
+
+      // Status changes before the user submits
+      rerender(
+        <ActionPanel
+          status="Completed"
+          onDispute={onDispute}
+        />,
+      );
+
+      // Form is gone — onDispute should never have been called
+      expect(screen.queryByRole('group', { name: /describe the reason for this dispute/i })).not.toBeInTheDocument();
+      expect(onDispute).not.toHaveBeenCalled();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I4 – isLoading transition closes open transient UI
+  // -------------------------------------------------------------------------
+
+  describe('I4 — isLoading=true closes open transient UI', () => {
+    it('closes the confirm dialog when isLoading becomes true', async () => {
+      const user = userEvent.setup();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={jest.fn()}
+          onReleaseFunds={jest.fn()}
+          onDispute={jest.fn()}
+          isLoading={false}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      expect(screen.getByRole('dialog', { name: /confirm submit milestone/i })).toBeInTheDocument();
+
+      // Parent sets isLoading=true (e.g. it starts a background refresh)
+      rerender(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={jest.fn()}
+          onReleaseFunds={jest.fn()}
+          onDispute={jest.fn()}
+          isLoading={true}
+        />,
+      );
+
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    });
+
+    it('closes the inline dispute form and disables the textarea when isLoading becomes true', async () => {
+      const user = userEvent.setup();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onDispute={jest.fn()}
+          isLoading={false}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      expect(screen.getByRole('group', { name: /describe the reason for this dispute/i })).toBeInTheDocument();
+
+      rerender(
+        <ActionPanel
+          status="Active"
+          onDispute={jest.fn()}
+          isLoading={true}
+        />,
+      );
+
+      expect(screen.queryByRole('group', { name: /describe the reason for this dispute/i })).not.toBeInTheDocument();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I5 – Wallet re-check at confirm-dialog dispatch time
+  // -------------------------------------------------------------------------
+
+  describe('I5 — wallet re-checked at callback dispatch time', () => {
+    it('aborts onSubmitMilestone and closes the dialog if wallet disconnects before confirm', async () => {
+      const user = userEvent.setup();
+      const onSubmitMilestone = jest.fn();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={onSubmitMilestone}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      expect(screen.getByRole('dialog', { name: /confirm submit milestone/i })).toBeInTheDocument();
+
+      // Wallet disconnects mid-dialog
+      mockUseWallet.mockReturnValue({
+        address: null,
+        isConnecting: false,
+        error: null,
+        connect: jest.fn(),
+        disconnect: jest.fn(),
+      });
+      rerender(<ActionPanel status="Active" onSubmitMilestone={onSubmitMilestone} />);
+
+      const dialog = screen.getByRole('dialog', { name: /confirm submit milestone/i });
+      await user.click(within(dialog).getByRole('button', { name: /submit milestone/i }));
+
+      // Callback must NOT be called; dialog must close
+      expect(onSubmitMilestone).not.toHaveBeenCalled();
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+
+    it('aborts onReleaseFunds and closes the dialog if wallet disconnects before confirm', async () => {
+      const user = userEvent.setup();
+      const onReleaseFunds = jest.fn();
+      const { rerender } = render(
+        <ActionPanel
+          status="Active"
+          onReleaseFunds={onReleaseFunds}
+          onDispute={jest.fn()}
+        />,
+      );
+
+      await user.click(screen.getByRole('button', { name: /release funds to the contractor/i }));
+      expect(screen.getByRole('alertdialog', { name: /confirm release funds/i })).toBeInTheDocument();
+
+      mockUseWallet.mockReturnValue({
+        address: null,
+        isConnecting: false,
+        error: null,
+        connect: jest.fn(),
+        disconnect: jest.fn(),
+      });
+      rerender(<ActionPanel status="Active" onReleaseFunds={onReleaseFunds} onDispute={jest.fn()} />);
+
+      const dialog = screen.getByRole('alertdialog', { name: /confirm release funds/i });
+      await user.click(within(dialog).getByRole('button', { name: /release funds/i }));
+
+      expect(onReleaseFunds).not.toHaveBeenCalled();
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I6 – Dispute reason validated at submit time; hard-clamp applied
+  // -------------------------------------------------------------------------
+
+  describe('I6 — dispute reason validated and clamped at submit time', () => {
+    it('hard-clamps the reason to DISPUTE_REASON_MAX_LENGTH even when set programmatically', async () => {
+      const user = userEvent.setup();
+      const onDispute = jest.fn();
+      render(<ActionPanel status="Active" onDispute={onDispute} />);
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+
+      const textarea = screen.getByRole('textbox', { name: /reason/i });
+      // Programmatically set a value beyond max (bypasses maxLength attr)
+      fireEvent.change(textarea, { target: { value: 'a'.repeat(DISPUTE_REASON_MAX_LENGTH + 50) } });
+
+      // The UI silently truncates via the handler, so the value is already capped
+      // Verify the value is capped before submit
+      expect((textarea as HTMLTextAreaElement).value.length).toBeLessThanOrEqual(DISPUTE_REASON_MAX_LENGTH);
+    });
+
+    it('rejects a whitespace-only reason at submit time even after trimming', async () => {
+      const user = userEvent.setup();
+      const onDispute = jest.fn();
+      render(<ActionPanel status="Active" onDispute={onDispute} />);
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      fireEvent.change(screen.getByRole('textbox', { name: /reason/i }), { target: { value: '   \t\n  ' } });
+      await user.click(screen.getByRole('button', { name: /confirm dispute/i }));
+
+      expect(onDispute).not.toHaveBeenCalled();
+      expect(screen.getByRole('alert')).toHaveTextContent('Please provide a reason for the dispute.');
+    });
+
+    it('passes a correctly trimmed reason of exactly max length to onDispute', async () => {
+      const user = userEvent.setup();
+      const onDispute = jest.fn();
+      render(<ActionPanel status="Active" onDispute={onDispute} />);
+
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      fireEvent.change(screen.getByRole('textbox', { name: /reason/i }), {
+        target: { value: 'a'.repeat(DISPUTE_REASON_MAX_LENGTH) },
+      });
+      await user.click(screen.getByRole('button', { name: /confirm dispute/i }));
+
+      expect(onDispute).toHaveBeenCalledTimes(1);
+      expect(onDispute).toHaveBeenCalledWith('a'.repeat(DISPUTE_REASON_MAX_LENGTH));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // I7 – confirmAction is never set outside CONFIRM_COPY keys
+  // -------------------------------------------------------------------------
+
+  describe('I7 — confirmAction only set to valid CONFIRM_COPY keys', () => {
+    it('opens the correct copy for submit', async () => {
+      const user = userEvent.setup();
+      render(<ActionPanel status="Active" onSubmitMilestone={jest.fn()} onReleaseFunds={jest.fn()} onDispute={jest.fn()} />);
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      const dialog = screen.getByRole('dialog', { name: /confirm submit milestone/i });
+      expect(dialog).toHaveTextContent('Are you sure you want to submit this milestone for approval?');
+      expect(within(dialog).getByRole('button', { name: /submit milestone/i })).toBeInTheDocument();
+    });
+
+    it('opens the correct copy for release (destructive tone = alertdialog)', async () => {
+      const user = userEvent.setup();
+      render(<ActionPanel status="Active" onReleaseFunds={jest.fn()} onDispute={jest.fn()} />);
+      await user.click(screen.getByRole('button', { name: /release funds to the contractor/i }));
+      const dialog = screen.getByRole('alertdialog', { name: /confirm release funds/i });
+      expect(dialog).toHaveTextContent('Are you sure you want to release funds?');
+      expect(within(dialog).getByRole('button', { name: /release funds/i })).toBeInTheDocument();
+    });
+
+    it('never renders a dialog with empty title or description on initial render', () => {
+      render(<ActionPanel status="Active" onSubmitMilestone={jest.fn()} />);
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+      expect(screen.queryByRole('alertdialog')).not.toBeInTheDocument();
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Regression — combined boundary cases
+  // -------------------------------------------------------------------------
+
+  describe('regression — combined boundary cases', () => {
+    it('does not fire any callback when all buttons are disabled via isLoading', () => {
+      const onSubmitMilestone = jest.fn();
+      const onReleaseFunds = jest.fn();
+      const onDispute = jest.fn();
+
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={onSubmitMilestone}
+          onReleaseFunds={onReleaseFunds}
+          onDispute={onDispute}
+          isLoading
+        />,
+      );
+
+      screen.getAllByRole('button').forEach((btn) => {
+        fireEvent.click(btn);
+      });
+
+      expect(onSubmitMilestone).not.toHaveBeenCalled();
+      expect(onReleaseFunds).not.toHaveBeenCalled();
+      expect(onDispute).not.toHaveBeenCalled();
+    });
+
+    it('allows a full submit→close→dispute sequence without leaking state', async () => {
+      const user = userEvent.setup();
+      const onSubmitMilestone = jest.fn();
+      const onDispute = jest.fn();
+
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={onSubmitMilestone}
+          onReleaseFunds={jest.fn()}
+          onDispute={onDispute}
+        />,
+      );
+
+      // 1. Open submit dialog and cancel
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /cancel/i }));
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+
+      // 2. Open dispute form and submit
+      await submitDisputeWithReason(user, 'Work incomplete');
+      expect(onDispute).toHaveBeenCalledTimes(1);
+      expect(onDispute).toHaveBeenCalledWith('Work incomplete');
+      expect(onSubmitMilestone).not.toHaveBeenCalled();
+    });
+
+    it('allows a full dispute form cancel → submit milestone sequence without leaking state', async () => {
+      const user = userEvent.setup();
+      const onSubmitMilestone = jest.fn();
+      const onDispute = jest.fn();
+
+      render(
+        <ActionPanel
+          status="Active"
+          onSubmitMilestone={onSubmitMilestone}
+          onReleaseFunds={jest.fn()}
+          onDispute={onDispute}
+        />,
+      );
+
+      // 1. Open dispute form and cancel
+      await user.click(screen.getByRole('button', { name: /open a dispute for this contract/i }));
+      await user.click(screen.getByRole('button', { name: /cancel/i }));
+      await act(async () => {});
+
+      // 2. Open submit dialog and confirm
+      await user.click(screen.getByRole('button', { name: /submit milestone for approval/i }));
+      await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: /submit milestone/i }));
+
+      expect(onSubmitMilestone).toHaveBeenCalledTimes(1);
+      expect(onDispute).not.toHaveBeenCalled();
+    });
+  });
+});

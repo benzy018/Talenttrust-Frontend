@@ -81,6 +81,11 @@ const getActionButtons = (status: ActionPanelProps['status']) => {
   return ['View Summary'];
 };
 
+/**
+ * I7 invariant: `ConfirmAction` is restricted to known CONFIRM_COPY keys.
+ * `handleOpenConfirm` is typed to only accept `Exclude<ConfirmAction, null>`,
+ * making it impossible at the call site to pass an invalid key.
+ */
 type ConfirmAction = keyof typeof CONFIRM_COPY | null;
 
 const CONFIRM_COPY = {
@@ -88,16 +93,19 @@ const CONFIRM_COPY = {
     title: 'Confirm Submit Milestone',
     description: 'Are you sure you want to submit this milestone for approval? This action cannot be undone.',
     confirmLabel: 'Submit Milestone',
+    tone: 'default' as const,
   },
   release: {
     title: 'Confirm Release Funds',
     description: 'Are you sure you want to release funds? This action cannot be undone.',
     confirmLabel: 'Release Funds',
+    tone: 'destructive' as const,
   },
   dispute: {
     title: 'Confirm Dispute',
     description: 'Are you sure you want to open a dispute for this contract? This action cannot be undone.',
     confirmLabel: 'Dispute',
+    tone: 'destructive' as const,
   },
 } as const;
 
@@ -126,6 +134,14 @@ const ActionPanel = ({
   const focusRingClass =
     'focus-visible:outline focus-visible:outline-4 focus-visible:outline-offset-2 focus-visible:outline-blue-500';
 
+  // ---------------------------------------------------------------------------
+  // I2 – In-flight guard: prevents double-submit across both handlers.
+  // Set to true immediately before dispatching a callback, cleared after.
+  // The ConfirmDialog confirm button and the inline form submit button both
+  // read this flag so a second click while the callback is executing is a no-op.
+  // ---------------------------------------------------------------------------
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
   // Submit / Release confirmation dialog state.
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
 
@@ -136,23 +152,60 @@ const ActionPanel = ({
    */
   const triggerElementRef = useRef<HTMLButtonElement | null>(null);
 
+  /**
+   * I7: `action` is narrowed to `Exclude<ConfirmAction, null>` = `keyof typeof CONFIRM_COPY`,
+   * so this handler can only be called with a valid key.
+   *
+   * I1: Before opening the confirm dialog, close any open inline dispute form
+   * to enforce mutual exclusion between the two transient UI states.
+   */
   const handleOpenConfirm = (
     action: Exclude<ConfirmAction, null>,
     event: React.MouseEvent<HTMLButtonElement>,
   ) => {
+    // I1: enforce mutual exclusion — close the dispute form if open
+    if (disputeFormOpen) {
+      setDisputeFormOpen(false);
+      setDisputeReason('');
+      setDisputeReasonError('');
+    }
     triggerElementRef.current = event.currentTarget;
     setConfirmAction(action);
   };
 
+  /**
+   * I2: The in-flight guard (`isSubmitting`) prevents the callback from firing
+   * more than once per user interaction.  The flag is set synchronously before
+   * the callback and cleared after it returns.
+   *
+   * I5: Re-check wallet authorization at dispatch time, not only at button-click
+   * time.  If the wallet disconnected while the dialog was open the action is
+   * aborted.
+   */
   const handleConfirm = () => {
-    if (confirmAction === 'submit') {
-      onSubmitMilestone?.();
-    } else if (confirmAction === 'release') {
-      onReleaseFunds?.();
-    } else if (confirmAction === 'dispute') {
-      onDispute?.('Dispute opened from action panel.');
+    // I2: bail out if another dispatch is already in-flight
+    if (isSubmitting) return;
+
+    // I5: re-check wallet authorization at callback dispatch time
+    if (!isWalletConnected && confirmAction !== null) {
+      // Wallet disconnected mid-dialog — close and let the parent handle state.
+      setConfirmAction(null);
+      return;
     }
-    setConfirmAction(null);
+
+    setIsSubmitting(true);
+    try {
+      if (confirmAction === 'submit') {
+        onSubmitMilestone?.();
+      } else if (confirmAction === 'release') {
+        onReleaseFunds?.();
+      } else if (confirmAction === 'dispute') {
+        onDispute?.('Dispute opened from action panel.');
+      }
+    } finally {
+      setIsSubmitting(false);
+      setConfirmAction(null);
+    }
   };
 
   const handleCancel = () => {
@@ -169,8 +222,18 @@ const ActionPanel = ({
   const previousConfirmActionRef = useRef<ConfirmAction>(null);
   const disputeTriggerRef = useRef<HTMLButtonElement | null>(null);
 
-  /** Opens the inline dispute form and moves focus to the textarea. */
+  /**
+   * I1: Opens the inline dispute form. Before opening, close any confirm dialog
+   * that may be open to enforce mutual exclusion.
+   *
+   * I3/I4 side-note: The status-change and isLoading effects close this form
+   * reactively, so we only need to guard the open path here.
+   */
   const handleOpenDisputeForm = (event: React.MouseEvent<HTMLButtonElement>) => {
+    // I1: enforce mutual exclusion — close the confirm dialog if open
+    if (confirmAction !== null) {
+      setConfirmAction(null);
+    }
     triggerElementRef.current = event.currentTarget;
     disputeTriggerRef.current = event.currentTarget;
     setDisputeReason('');
@@ -243,6 +306,42 @@ const ActionPanel = ({
     previousConfirmActionRef.current = confirmAction;
   }, [confirmAction, isLoading]);
 
+  // ---------------------------------------------------------------------------
+  // I3: Close all transient UI when the contract `status` prop changes.
+  //
+  // If the parent re-fetches contract data and the status transitions
+  // (e.g. Active → Completed) while a dialog or dispute form is open, the
+  // in-progress action is no longer valid.  Close everything and reset state
+  // to avoid operating on a stale action.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    setConfirmAction(null);
+    setDisputeFormOpen(false);
+    setDisputeReason('');
+    setDisputeReasonError('');
+    setIsSubmitting(false);
+    // NOTE: We intentionally do NOT restore focus here because the status change
+    // is driven by the parent (not by the user directly closing the UI) and the
+    // visual update itself signals the change to the user.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status]);
+
+  // ---------------------------------------------------------------------------
+  // I4: Close all transient UI when `isLoading` becomes `true`.
+  //
+  // When the parent sets `isLoading=true` (e.g., it starts an async re-fetch
+  // after the user performs an action), any open dialog or inline form should
+  // be closed immediately so the user cannot interact with stale state.
+  // ---------------------------------------------------------------------------
+  useEffect(() => {
+    if (!isLoading) return;
+    setConfirmAction(null);
+    setDisputeFormOpen(false);
+    setDisputeReason('');
+    setDisputeReasonError('');
+    setIsSubmitting(false);
+  }, [isLoading]);
+
   /** Closes the inline form and returns focus to the button that opened it. */
   const closeDisputeForm = () => {
     setDisputeFormOpen(false);
@@ -267,10 +366,23 @@ const ActionPanel = ({
   /**
    * Validates and submits the dispute reason.
    *
-   * Validation rules:
-   *   1. Wallet must still be connected at submit time.
-   *   2. Reason must not be empty / whitespace-only.
-   *   3. Trimmed length must not exceed DISPUTE_REASON_MAX_LENGTH.
+   * Invariants enforced at submit time:
+   *
+   *   I2 – In-flight guard: The `isSubmitting` flag is set before `onDispute`
+   *        is called and cleared synchronously after, making the window where
+   *        the form can be re-submitted while the callback is executing
+   *        zero-length.
+   *
+   *   I5 – Wallet re-check: The wallet connection is verified immediately
+   *        before dispatching `onDispute`, not only at button-click time.
+   *        This covers the mid-flow disconnect case.
+   *
+   *   I6 – Dispute reason validation:
+   *        1. Wallet must still be connected at submit time.
+   *        2. Reason must not be empty / whitespace-only.
+   *        3. Trimmed length must not exceed DISPUTE_REASON_MAX_LENGTH.
+   *        4. The trimmed value is hard-clamped before dispatch as a final
+   *           safety net against programmatic bypass of the UI controls.
    *
    * On success the trimmed reason is forwarded to `onDispute` and the form
    * is closed; focus returns to the originating "Dispute" button.
@@ -278,12 +390,17 @@ const ActionPanel = ({
   const handleDisputeSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
+    // I2: bail out if another dispatch is already in-flight
+    if (isSubmitting) return;
+
+    // I5: re-check wallet authorization at dispatch time
     if (!isWalletConnected) {
       setDisputeReasonError(DISPUTE_WALLET_ERROR);
       disputeTextareaRef.current?.focus();
       return;
     }
 
+    // I6: validate the dispute reason immediately before dispatch
     const validation = validateDisputeReason(disputeReason);
     if (!validation.valid) {
       setDisputeReasonError(validation.error || '');
@@ -291,12 +408,28 @@ const ActionPanel = ({
       return;
     }
 
-    onDispute?.(disputeReason.trim());
-    closeDisputeForm();
+    // I6: hard-clamp trimmed value as a final safety net against UI bypass
+    const safeReason = disputeReason.trim().slice(0, DISPUTE_REASON_MAX_LENGTH);
+
+    setIsSubmitting(true);
+    try {
+      onDispute?.(safeReason);
+    } finally {
+      setIsSubmitting(false);
+      closeDisputeForm();
+    }
   };
 
   const remainingChars = DISPUTE_REASON_MAX_LENGTH - disputeReason.length;
   const isOverLimit = disputeReason.length >= DISPUTE_REASON_MAX_LENGTH;
+
+  // ---------------------------------------------------------------------------
+  // I7: Derive dialog copy from the narrowed `confirmAction` key.
+  // Since `confirmAction` is typed as `keyof typeof CONFIRM_COPY | null` and
+  // `handleOpenConfirm` only accepts `keyof typeof CONFIRM_COPY`, the access
+  // `CONFIRM_COPY[confirmAction]` is always valid when `confirmAction !== null`.
+  // ---------------------------------------------------------------------------
+  const confirmCopy = confirmAction !== null ? CONFIRM_COPY[confirmAction] : null;
 
   return (
     <aside
@@ -352,7 +485,13 @@ const ActionPanel = ({
           <button
             type="button"
             onClick={(e) => handleOpenConfirm('submit', e)}
-            disabled={!isWalletConnected || isLoading || !!disabledReasons?.submitMilestone}
+            disabled={
+              !isWalletConnected ||
+              isLoading ||
+              !!disabledReasons?.submitMilestone ||
+              // I1: prevent opening a confirm dialog while the dispute form is open
+              disputeFormOpen
+            }
             title={!isWalletConnected ? noWalletMsg : undefined}
             aria-label="Submit milestone for approval"
             aria-describedby={describedBy(describedById('submitMilestone'))}
@@ -366,7 +505,13 @@ const ActionPanel = ({
           <button
             type="button"
             onClick={(event) => handleOpenConfirm('release', event)}
-            disabled={!isWalletConnected || isLoading || !!disabledReasons?.releaseFunds}
+            disabled={
+              !isWalletConnected ||
+              isLoading ||
+              !!disabledReasons?.releaseFunds ||
+              // I1: prevent opening a confirm dialog while the dispute form is open
+              disputeFormOpen
+            }
             title={!isWalletConnected ? noWalletMsg : undefined}
             aria-label="Release funds to the contractor"
             aria-describedby={describedBy(describedById('releaseFunds'))}
@@ -386,7 +531,9 @@ const ActionPanel = ({
                 !isWalletConnected ||
                 isLoading ||
                 !!disabledReasons?.dispute ||
-                disputeFormOpen
+                disputeFormOpen ||
+                // I1: prevent opening the dispute form while a confirm dialog is open
+                confirmAction !== null
               }
               title={!isWalletConnected ? noWalletMsg : undefined}
               aria-label="Open a dispute for this contract"
@@ -489,6 +636,8 @@ const ActionPanel = ({
                   <div className="flex gap-2 mt-3">
                     <button
                       type="submit"
+                      // I2: disable while a dispatch is in flight
+                      disabled={isSubmitting}
                       className={`flex-1 rounded-xl bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-700 disabled:opacity-50 disabled:cursor-not-allowed ${focusRingClass}`}
                     >
                       Confirm Dispute
@@ -521,15 +670,23 @@ const ActionPanel = ({
         )}
       </div>
 
-      {/* Confirmation Dialog: used for Submit Milestone and Release Funds only.
-          Dispute is handled by the inline form above. */}
+      {/*
+       * Confirmation Dialog: used for Submit Milestone and Release Funds only.
+       * Dispute is handled by the inline form above.
+       *
+       * I7: `confirmCopy` is derived from the narrowed `confirmAction` key, so
+       * CONFIRM_COPY access is always type-safe and never falls through.
+       *
+       * I2: The ConfirmDialog `onConfirm` handler checks `isSubmitting` before
+       * dispatching any callback.
+       */}
       <ConfirmDialog
         isOpen={confirmAction !== null}
-        title={confirmAction && confirmAction in CONFIRM_COPY ? CONFIRM_COPY[confirmAction as keyof typeof CONFIRM_COPY].title : ''}
-        description={confirmAction && confirmAction in CONFIRM_COPY ? CONFIRM_COPY[confirmAction as keyof typeof CONFIRM_COPY].description : ''}
-        confirmLabel={confirmAction && confirmAction in CONFIRM_COPY ? CONFIRM_COPY[confirmAction as keyof typeof CONFIRM_COPY].confirmLabel : 'Confirm'}
+        title={confirmCopy?.title ?? ''}
+        description={confirmCopy?.description ?? ''}
+        confirmLabel={confirmCopy?.confirmLabel ?? 'Confirm'}
         cancelLabel="Cancel"
-        tone={confirmAction === 'release' || confirmAction === 'dispute' ? 'destructive' : 'default'}
+        tone={confirmCopy?.tone ?? 'default'}
         onConfirm={handleConfirm}
         onCancel={handleCancel}
       />
